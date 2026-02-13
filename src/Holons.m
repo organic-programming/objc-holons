@@ -31,6 +31,12 @@ static NSString *const HOLErrorDomain = @"org.organicprogramming.holons";
 @implementation HOLWSListener
 @end
 
+@implementation HOLConnection
+@end
+
+@implementation HOLHolonIdentity
+@end
+
 NSString *HOLScheme(NSString *uri) {
   NSRange r = [uri rangeOfString:@"://"];
   if (r.location != NSNotFound) {
@@ -84,6 +90,12 @@ static BOOL HOLSplitHostPort(NSString *addr, int defaultPort, NSString **hostOut
   return YES;
 }
 
+static NSError *HOLMakeError(NSInteger code, NSString *message) {
+  return [NSError errorWithDomain:HOLErrorDomain
+                             code:code
+                         userInfo:@{NSLocalizedDescriptionKey : message}];
+}
+
 HOLParsedURI *HOLParseURI(NSString *uri) {
   NSString *s = HOLScheme(uri);
   HOLParsedURI *parsed = [HOLParsedURI new];
@@ -128,7 +140,7 @@ HOLParsedURI *HOLParseURI(NSString *uri) {
     parsed.scheme = @"mem";
     parsed.host = nil;
     parsed.port = nil;
-    parsed.path = nil;
+    parsed.path = parsed.raw.length > 6 ? [parsed.raw substringFromIndex:6] : @"";
     parsed.secure = NO;
     return parsed;
   }
@@ -290,12 +302,24 @@ HOLTransportListener *HOLListen(NSString *uri, NSError **error) {
   if ([parsed.scheme isEqualToString:@"stdio"]) {
     HOLStdioListener *lis = [HOLStdioListener new];
     lis.address = @"stdio://";
+    lis.consumed = NO;
     return lis;
   }
 
   if ([parsed.scheme isEqualToString:@"mem"]) {
+    int fds[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+      if (error != NULL) {
+        *error = HOLMakeError(11, [NSString stringWithUTF8String:strerror(errno)]);
+      }
+      return nil;
+    }
     HOLMemListener *lis = [HOLMemListener new];
-    lis.address = @"mem://";
+    lis.address = parsed.raw ?: @"mem://";
+    lis.serverFD = fds[0];
+    lis.clientFD = fds[1];
+    lis.serverConsumed = NO;
+    lis.clientConsumed = NO;
     return lis;
   }
 
@@ -319,6 +343,147 @@ HOLTransportListener *HOLListen(NSString *uri, NSError **error) {
   return nil;
 }
 
+HOLConnection *HOLAccept(HOLTransportListener *listener, NSError **error) {
+  if ([listener isKindOfClass:[HOLTcpListener class]]) {
+    HOLTcpListener *tcp = (HOLTcpListener *)listener;
+    int fd = accept(tcp.fd, NULL, NULL);
+    if (fd < 0) {
+      if (error != NULL) {
+        *error = HOLMakeError(12, [NSString stringWithUTF8String:strerror(errno)]);
+      }
+      return nil;
+    }
+    HOLConnection *conn = [HOLConnection new];
+    conn.readFD = fd;
+    conn.writeFD = fd;
+    conn.scheme = @"tcp";
+    conn.ownsReadFD = YES;
+    conn.ownsWriteFD = YES;
+    return conn;
+  }
+
+  if ([listener isKindOfClass:[HOLUnixListener class]]) {
+    HOLUnixListener *unixLis = (HOLUnixListener *)listener;
+    int fd = accept(unixLis.fd, NULL, NULL);
+    if (fd < 0) {
+      if (error != NULL) {
+        *error = HOLMakeError(13, [NSString stringWithUTF8String:strerror(errno)]);
+      }
+      return nil;
+    }
+    HOLConnection *conn = [HOLConnection new];
+    conn.readFD = fd;
+    conn.writeFD = fd;
+    conn.scheme = @"unix";
+    conn.ownsReadFD = YES;
+    conn.ownsWriteFD = YES;
+    return conn;
+  }
+
+  if ([listener isKindOfClass:[HOLStdioListener class]]) {
+    HOLStdioListener *stdioLis = (HOLStdioListener *)listener;
+    if (stdioLis.consumed) {
+      if (error != NULL) {
+        *error = HOLMakeError(14, @"stdio:// accepts exactly one connection");
+      }
+      return nil;
+    }
+    stdioLis.consumed = YES;
+    HOLConnection *conn = [HOLConnection new];
+    conn.readFD = STDIN_FILENO;
+    conn.writeFD = STDOUT_FILENO;
+    conn.scheme = @"stdio";
+    conn.ownsReadFD = NO;
+    conn.ownsWriteFD = NO;
+    return conn;
+  }
+
+  if ([listener isKindOfClass:[HOLMemListener class]]) {
+    HOLMemListener *memLis = (HOLMemListener *)listener;
+    if (memLis.serverConsumed || memLis.serverFD < 0) {
+      if (error != NULL) {
+        *error = HOLMakeError(15, @"mem:// server side already consumed");
+      }
+      return nil;
+    }
+    memLis.serverConsumed = YES;
+    int fd = memLis.serverFD;
+    memLis.serverFD = -1;
+
+    HOLConnection *conn = [HOLConnection new];
+    conn.readFD = fd;
+    conn.writeFD = fd;
+    conn.scheme = @"mem";
+    conn.ownsReadFD = YES;
+    conn.ownsWriteFD = YES;
+    return conn;
+  }
+
+  if ([listener isKindOfClass:[HOLWSListener class]]) {
+    if (error != NULL) {
+      *error = HOLMakeError(16, @"ws/wss runtime accept is unsupported (metadata-only listener)");
+    }
+    return nil;
+  }
+
+  if (error != NULL) {
+    *error = HOLMakeError(17, @"unsupported listener type");
+  }
+  return nil;
+}
+
+HOLConnection *HOLMemDial(HOLTransportListener *listener, NSError **error) {
+  if (![listener isKindOfClass:[HOLMemListener class]]) {
+    if (error != NULL) {
+      *error = HOLMakeError(18, @"HOLMemDial requires a mem:// listener");
+    }
+    return nil;
+  }
+
+  HOLMemListener *memLis = (HOLMemListener *)listener;
+  if (memLis.clientConsumed || memLis.clientFD < 0) {
+    if (error != NULL) {
+      *error = HOLMakeError(19, @"mem:// client side already consumed");
+    }
+    return nil;
+  }
+
+  memLis.clientConsumed = YES;
+  int fd = memLis.clientFD;
+  memLis.clientFD = -1;
+
+  HOLConnection *conn = [HOLConnection new];
+  conn.readFD = fd;
+  conn.writeFD = fd;
+  conn.scheme = @"mem";
+  conn.ownsReadFD = YES;
+  conn.ownsWriteFD = YES;
+  return conn;
+}
+
+ssize_t HOLConnectionRead(HOLConnection *connection, void *buffer, size_t count) {
+  return read(connection.readFD, buffer, count);
+}
+
+ssize_t HOLConnectionWrite(HOLConnection *connection, const void *buffer, size_t count) {
+  return write(connection.writeFD, buffer, count);
+}
+
+void HOLCloseConnection(HOLConnection *connection) {
+  int readFD = connection.readFD;
+  int writeFD = connection.writeFD;
+
+  if (connection.ownsReadFD && readFD >= 0) {
+    close(readFD);
+  }
+  if (connection.ownsWriteFD && writeFD >= 0 && writeFD != readFD) {
+    close(writeFD);
+  }
+
+  connection.readFD = -1;
+  connection.writeFD = -1;
+}
+
 NSString *HOLParseFlags(NSArray<NSString *> *args) {
   for (NSUInteger i = 0; i < args.count; i++) {
     if ([args[i] isEqualToString:@"--listen"] && i + 1 < args.count) {
@@ -329,6 +494,131 @@ NSString *HOLParseFlags(NSArray<NSString *> *args) {
     }
   }
   return HOLDefaultURI;
+}
+
+static NSString *HOLYAMLValue(NSString *line) {
+  NSRange colon = [line rangeOfString:@":"];
+  if (colon.location == NSNotFound) {
+    return @"";
+  }
+
+  NSString *value = [line substringFromIndex:colon.location + 1];
+  value = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+  if (value.length >= 2 && [value hasPrefix:@"\""] && [value hasSuffix:@"\""]) {
+    value = [value substringWithRange:NSMakeRange(1, value.length - 2)];
+  }
+  return value;
+}
+
+static NSArray<NSString *> *HOLYAMLList(NSString *value) {
+  NSString *trimmed = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+  if (![trimmed hasPrefix:@"["] || ![trimmed hasSuffix:@"]"]) {
+    return @[];
+  }
+
+  if (trimmed.length <= 2) {
+    return @[];
+  }
+
+  NSString *inner = [trimmed substringWithRange:NSMakeRange(1, trimmed.length - 2)];
+  NSArray<NSString *> *parts = [inner componentsSeparatedByString:@","];
+  NSMutableArray<NSString *> *items = [NSMutableArray arrayWithCapacity:parts.count];
+  for (NSString *part in parts) {
+    NSString *item = [part stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (item.length >= 2 && [item hasPrefix:@"\""] && [item hasSuffix:@"\""]) {
+      item = [item substringWithRange:NSMakeRange(1, item.length - 2)];
+    }
+    if (item.length > 0) {
+      [items addObject:item];
+    }
+  }
+  return items;
+}
+
+HOLHolonIdentity *HOLParseHolon(NSString *path, NSError **error) {
+  NSError *readError = nil;
+  NSString *text = [NSString stringWithContentsOfFile:path
+                                             encoding:NSUTF8StringEncoding
+                                                error:&readError];
+  if (text == nil) {
+    if (error != NULL) {
+      *error = readError;
+    }
+    return nil;
+  }
+
+  if (![text hasPrefix:@"---"]) {
+    if (error != NULL) {
+      *error = HOLMakeError(20, [NSString stringWithFormat:@"%@: missing YAML frontmatter", path]);
+    }
+    return nil;
+  }
+
+  NSRange end = [text rangeOfString:@"---" options:0 range:NSMakeRange(3, text.length - 3)];
+  if (end.location == NSNotFound) {
+    if (error != NULL) {
+      *error = HOLMakeError(21, [NSString stringWithFormat:@"%@: unterminated frontmatter", path]);
+    }
+    return nil;
+  }
+
+  NSString *frontmatter = [text substringWithRange:NSMakeRange(3, end.location - 3)];
+  NSArray<NSString *> *lines = [frontmatter componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+
+  HOLHolonIdentity *identity = [HOLHolonIdentity new];
+  identity.uuid = @"";
+  identity.givenName = @"";
+  identity.familyName = @"";
+  identity.motto = @"";
+  identity.composer = @"";
+  identity.clade = @"";
+  identity.status = @"";
+  identity.born = @"";
+  identity.lang = @"";
+  identity.parents = @[];
+  identity.reproduction = @"";
+  identity.generatedBy = @"";
+  identity.protoStatus = @"";
+  identity.aliases = @[];
+
+  for (NSString *rawLine in lines) {
+    NSString *line = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (line.length == 0 || [line hasPrefix:@"#"]) {
+      continue;
+    }
+
+    if ([line hasPrefix:@"uuid:"]) {
+      identity.uuid = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"given_name:"]) {
+      identity.givenName = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"family_name:"]) {
+      identity.familyName = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"motto:"]) {
+      identity.motto = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"composer:"]) {
+      identity.composer = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"clade:"]) {
+      identity.clade = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"status:"]) {
+      identity.status = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"born:"]) {
+      identity.born = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"lang:"]) {
+      identity.lang = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"reproduction:"]) {
+      identity.reproduction = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"generated_by:"]) {
+      identity.generatedBy = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"proto_status:"]) {
+      identity.protoStatus = HOLYAMLValue(line);
+    } else if ([line hasPrefix:@"parents:"]) {
+      identity.parents = HOLYAMLList(HOLYAMLValue(line));
+    } else if ([line hasPrefix:@"aliases:"]) {
+      identity.aliases = HOLYAMLList(HOLYAMLValue(line));
+    }
+  }
+
+  return identity;
 }
 
 void HOLCloseListener(HOLTransportListener *listener) {
@@ -348,6 +638,18 @@ void HOLCloseListener(HOLTransportListener *listener) {
     }
     if (unixLis.path.length > 0) {
       unlink(unixLis.path.UTF8String);
+    }
+    return;
+  }
+  if ([listener isKindOfClass:[HOLMemListener class]]) {
+    HOLMemListener *memLis = (HOLMemListener *)listener;
+    if (memLis.serverFD >= 0) {
+      close(memLis.serverFD);
+      memLis.serverFD = -1;
+    }
+    if (memLis.clientFD >= 0) {
+      close(memLis.clientFD);
+      memLis.clientFD = -1;
     }
   }
 }

@@ -32,10 +32,15 @@ extern NSString *const HOLDefaultURI;
 
 @interface HOLStdioListener : HOLTransportListener
 @property(nonatomic, copy) NSString *address;
+@property(nonatomic, assign) BOOL consumed;
 @end
 
 @interface HOLMemListener : HOLTransportListener
 @property(nonatomic, copy) NSString *address;
+@property(nonatomic, assign) int serverFD;
+@property(nonatomic, assign) int clientFD;
+@property(nonatomic, assign) BOOL serverConsumed;
+@property(nonatomic, assign) BOOL clientConsumed;
 @end
 
 @interface HOLWSListener : HOLTransportListener
@@ -43,6 +48,31 @@ extern NSString *const HOLDefaultURI;
 @property(nonatomic, assign) int port;
 @property(nonatomic, copy) NSString *path;
 @property(nonatomic, assign) BOOL secure;
+@end
+
+@interface HOLConnection : NSObject
+@property(nonatomic, assign) int readFD;
+@property(nonatomic, assign) int writeFD;
+@property(nonatomic, copy) NSString *scheme;
+@property(nonatomic, assign) BOOL ownsReadFD;
+@property(nonatomic, assign) BOOL ownsWriteFD;
+@end
+
+@interface HOLHolonIdentity : NSObject
+@property(nonatomic, copy) NSString *uuid;
+@property(nonatomic, copy) NSString *givenName;
+@property(nonatomic, copy) NSString *familyName;
+@property(nonatomic, copy) NSString *motto;
+@property(nonatomic, copy) NSString *composer;
+@property(nonatomic, copy) NSString *clade;
+@property(nonatomic, copy) NSString *status;
+@property(nonatomic, copy) NSString *born;
+@property(nonatomic, copy) NSString *lang;
+@property(nonatomic, copy) NSArray<NSString *> *parents;
+@property(nonatomic, copy) NSString *reproduction;
+@property(nonatomic, copy) NSString *generatedBy;
+@property(nonatomic, copy) NSString *protoStatus;
+@property(nonatomic, copy) NSArray<NSString *> *aliases;
 @end
 
 /// Extract the scheme from a transport URI.
@@ -54,8 +84,29 @@ HOLParsedURI *HOLParseURI(NSString *uri);
 /// Parse a transport URI and return a listener variant.
 HOLTransportListener *_Nullable HOLListen(NSString *uri, NSError *_Nullable *_Nullable error);
 
+/// Accept one runtime connection from a listener.
+HOLConnection *_Nullable HOLAccept(HOLTransportListener *listener,
+                                   NSError *_Nullable *_Nullable error);
+
+/// Dial the client side of a `mem://` listener.
+HOLConnection *_Nullable HOLMemDial(HOLTransportListener *listener,
+                                    NSError *_Nullable *_Nullable error);
+
+/// Read bytes from a runtime connection.
+ssize_t HOLConnectionRead(HOLConnection *connection, void *buffer, size_t count);
+
+/// Write bytes to a runtime connection.
+ssize_t HOLConnectionWrite(HOLConnection *connection, const void *buffer, size_t count);
+
+/// Close file descriptors held by a runtime connection.
+void HOLCloseConnection(HOLConnection *connection);
+
 /// Parse --listen or --port from command-line args.
 NSString *HOLParseFlags(NSArray<NSString *> *args);
+
+/// Parse HOLON.md identity YAML frontmatter.
+HOLHolonIdentity *_Nullable HOLParseHolon(NSString *path,
+                                          NSError *_Nullable *_Nullable error);
 
 /// Close any open descriptors associated with a listener.
 void HOLCloseListener(HOLTransportListener *listener);
