@@ -58,6 +58,41 @@ extern NSString *const HOLDefaultURI;
 @property(nonatomic, assign) BOOL ownsWriteFD;
 @end
 
+typedef NSDictionary<NSString *, id> *_Nonnull (^HOLHolonRPCHandler)(
+    NSDictionary<NSString *, id> *_Nonnull params);
+
+@interface HOLHolonRPCClient : NSObject <NSURLSessionWebSocketDelegate, NSURLSessionTaskDelegate>
+
+- (instancetype)init;
+
+- (instancetype)initWithHeartbeatIntervalMS:(NSInteger)heartbeatIntervalMS
+                         heartbeatTimeoutMS:(NSInteger)heartbeatTimeoutMS
+                        reconnectMinDelayMS:(NSInteger)reconnectMinDelayMS
+                        reconnectMaxDelayMS:(NSInteger)reconnectMaxDelayMS
+                            reconnectFactor:(double)reconnectFactor
+                            reconnectJitter:(double)reconnectJitter
+                           connectTimeoutMS:(NSInteger)connectTimeoutMS
+                           requestTimeoutMS:(NSInteger)requestTimeoutMS NS_DESIGNATED_INITIALIZER;
+
+- (BOOL)connect:(NSString *)url error:(NSError *_Nullable *_Nullable)error;
+
+- (nullable NSDictionary<NSString *, id> *)invoke:(NSString *)method
+                                            params:
+                                                (nullable NSDictionary<NSString *, id> *)params
+                                           timeout:(NSTimeInterval)timeout
+                                             error:(NSError *_Nullable *_Nullable)error;
+
+- (nullable NSDictionary<NSString *, id> *)invoke:(NSString *)method
+                                            params:
+                                                (nullable NSDictionary<NSString *, id> *)params
+                                             error:(NSError *_Nullable *_Nullable)error;
+
+- (void)registerMethod:(NSString *)method handler:(HOLHolonRPCHandler)handler;
+
+- (void)close;
+
+@end
+
 @interface HOLHolonIdentity : NSObject
 @property(nonatomic, copy) NSString *uuid;
 @property(nonatomic, copy) NSString *givenName;

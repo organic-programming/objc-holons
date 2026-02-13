@@ -6,9 +6,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <math.h>
 
 NSString *const HOLDefaultURI = @"tcp://:9090";
 static NSString *const HOLErrorDomain = @"org.organicprogramming.holons";
+static NSError *HOLMakeError(NSInteger code, NSString *message);
 
 @implementation HOLParsedURI
 @end
@@ -35,6 +37,709 @@ static NSString *const HOLErrorDomain = @"org.organicprogramming.holons";
 @end
 
 @implementation HOLHolonIdentity
+@end
+
+@interface HOLPendingCall : NSObject
+@property(nonatomic, strong) dispatch_semaphore_t semaphore;
+@property(nonatomic, strong, nullable) NSDictionary<NSString *, id> *result;
+@property(nonatomic, strong, nullable) NSError *error;
+@end
+
+@implementation HOLPendingCall
+@end
+
+@interface HOLHolonRPCClient ()
+@property(nonatomic, assign) NSInteger heartbeatIntervalMS;
+@property(nonatomic, assign) NSInteger heartbeatTimeoutMS;
+@property(nonatomic, assign) NSInteger reconnectMinDelayMS;
+@property(nonatomic, assign) NSInteger reconnectMaxDelayMS;
+@property(nonatomic, assign) double reconnectFactor;
+@property(nonatomic, assign) double reconnectJitter;
+@property(nonatomic, assign) NSInteger connectTimeoutMS;
+@property(nonatomic, assign) NSInteger requestTimeoutMS;
+
+@property(nonatomic, strong) NSURLSession *session;
+@property(nonatomic, strong, nullable) NSURLSessionWebSocketTask *task;
+@property(nonatomic, copy, nullable) NSString *endpoint;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, HOLPendingCall *> *pending;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, HOLHolonRPCHandler> *handlers;
+@property(nonatomic, strong) dispatch_semaphore_t stateSignal;
+@property(nonatomic, strong, nullable) dispatch_semaphore_t connectSemaphore;
+@property(nonatomic, strong, nullable) dispatch_source_t heartbeatTimer;
+@property(nonatomic, strong) dispatch_queue_t timerQueue;
+@property(nonatomic, strong, nullable) NSError *lastConnectionError;
+@property(nonatomic, assign) BOOL connected;
+@property(nonatomic, assign) BOOL closed;
+@property(nonatomic, assign) BOOL reconnectScheduled;
+@property(nonatomic, assign) NSUInteger reconnectAttempt;
+@property(nonatomic, assign) NSUInteger nextID;
+@end
+
+static NSString *HOLRPCIDString(id _Nullable rawID) {
+  if (rawID == nil || rawID == [NSNull null]) {
+    return nil;
+  }
+  if ([rawID isKindOfClass:[NSString class]]) {
+    return (NSString *)rawID;
+  }
+  if ([rawID respondsToSelector:@selector(stringValue)]) {
+    return [rawID stringValue];
+  }
+  return [rawID description];
+}
+
+@implementation HOLHolonRPCClient
+
+- (instancetype)init {
+  return [self initWithHeartbeatIntervalMS:15000
+                        heartbeatTimeoutMS:5000
+                       reconnectMinDelayMS:500
+                       reconnectMaxDelayMS:30000
+                           reconnectFactor:2.0
+                           reconnectJitter:0.1
+                          connectTimeoutMS:10000
+                          requestTimeoutMS:10000];
+}
+
+- (instancetype)initWithHeartbeatIntervalMS:(NSInteger)heartbeatIntervalMS
+                         heartbeatTimeoutMS:(NSInteger)heartbeatTimeoutMS
+                        reconnectMinDelayMS:(NSInteger)reconnectMinDelayMS
+                        reconnectMaxDelayMS:(NSInteger)reconnectMaxDelayMS
+                            reconnectFactor:(double)reconnectFactor
+                            reconnectJitter:(double)reconnectJitter
+                           connectTimeoutMS:(NSInteger)connectTimeoutMS
+                           requestTimeoutMS:(NSInteger)requestTimeoutMS {
+  self = [super init];
+  if (!self) {
+    return nil;
+  }
+
+  _heartbeatIntervalMS = heartbeatIntervalMS;
+  _heartbeatTimeoutMS = heartbeatTimeoutMS;
+  _reconnectMinDelayMS = reconnectMinDelayMS;
+  _reconnectMaxDelayMS = reconnectMaxDelayMS;
+  _reconnectFactor = reconnectFactor;
+  _reconnectJitter = reconnectJitter;
+  _connectTimeoutMS = connectTimeoutMS;
+  _requestTimeoutMS = requestTimeoutMS;
+
+  NSOperationQueue *delegateQueue = [NSOperationQueue new];
+  delegateQueue.maxConcurrentOperationCount = 1;
+  NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+  _session = [NSURLSession sessionWithConfiguration:cfg
+                                           delegate:self
+                                      delegateQueue:delegateQueue];
+  _pending = [NSMutableDictionary dictionary];
+  _handlers = [NSMutableDictionary dictionary];
+  _stateSignal = dispatch_semaphore_create(0);
+  _timerQueue = dispatch_queue_create("org.organicprogramming.holons.rpc.timer",
+                                      DISPATCH_QUEUE_SERIAL);
+  _closed = YES;
+  _connected = NO;
+  _reconnectScheduled = NO;
+  _reconnectAttempt = 0;
+  _nextID = 0;
+  return self;
+}
+
+- (void)dealloc {
+  [self close];
+  [_session finishTasksAndInvalidate];
+#if !__has_feature(objc_arc)
+  [super dealloc];
+#endif
+}
+
+- (BOOL)connect:(NSString *)url error:(NSError **)error {
+  if (url.length == 0) {
+    if (error != NULL) {
+      *error = HOLMakeError(1000, @"url is required");
+    }
+    return NO;
+  }
+
+  [self close];
+
+  @synchronized(self) {
+    self.closed = NO;
+    self.connected = NO;
+    self.endpoint = [url copy];
+    self.lastConnectionError = nil;
+    self.connectSemaphore = dispatch_semaphore_create(0);
+    self.reconnectAttempt = 0;
+  }
+
+  [self openWebSocket];
+
+  long waitRC = dispatch_semaphore_wait(
+      self.connectSemaphore,
+      dispatch_time(DISPATCH_TIME_NOW, self.connectTimeoutMS * NSEC_PER_MSEC));
+
+  NSError *connectError = nil;
+  @synchronized(self) {
+    if (waitRC != 0) {
+      connectError = HOLMakeError(1001, @"holon-rpc connect timeout");
+    } else if (!self.connected) {
+      connectError = self.lastConnectionError ?: HOLMakeError(1002, @"holon-rpc connect failed");
+    }
+    self.connectSemaphore = nil;
+  }
+
+  if (connectError != nil) {
+    if (error != NULL) {
+      *error = connectError;
+    }
+    [self close];
+    return NO;
+  }
+
+  return YES;
+}
+
+- (nullable NSDictionary<NSString *, id> *)invoke:(NSString *)method
+                                            params:(NSDictionary<NSString *, id> *)params
+                                             error:(NSError **)error {
+  return [self invoke:method params:params timeout:self.requestTimeoutMS error:error];
+}
+
+- (nullable NSDictionary<NSString *, id> *)invoke:(NSString *)method
+                                            params:(NSDictionary<NSString *, id> *)params
+                                           timeout:(NSTimeInterval)timeout
+                                             error:(NSError **)error {
+  if (method.length == 0) {
+    if (error != NULL) {
+      *error = HOLMakeError(1003, @"method is required");
+    }
+    return nil;
+  }
+
+  if (![self waitUntilConnected:self.connectTimeoutMS error:error]) {
+    return nil;
+  }
+
+  NSString *requestID = nil;
+  HOLPendingCall *call = [HOLPendingCall new];
+  call.semaphore = dispatch_semaphore_create(0);
+
+  @synchronized(self) {
+    requestID = [NSString stringWithFormat:@"c%lu", (unsigned long)++self.nextID];
+    self.pending[requestID] = call;
+  }
+
+  NSDictionary *payload = @{
+    @"jsonrpc" : @"2.0",
+    @"id" : requestID,
+    @"method" : method,
+    @"params" : params ?: @{}
+  };
+
+  NSError *sendError = nil;
+  if (![self sendPayload:payload timeoutMS:timeout error:&sendError]) {
+    @synchronized(self) {
+      [self.pending removeObjectForKey:requestID];
+    }
+    if (error != NULL) {
+      *error = sendError;
+    }
+    return nil;
+  }
+
+  long waitRC = dispatch_semaphore_wait(call.semaphore,
+                                        dispatch_time(DISPATCH_TIME_NOW, timeout * NSEC_PER_MSEC));
+  if (waitRC != 0) {
+    @synchronized(self) {
+      [self.pending removeObjectForKey:requestID];
+    }
+    if (error != NULL) {
+      *error = HOLMakeError(1004, @"invoke timeout");
+    }
+    return nil;
+  }
+
+  if (call.error != nil) {
+    if (error != NULL) {
+      *error = call.error;
+    }
+    return nil;
+  }
+
+  return call.result ?: @{};
+}
+
+- (void)registerMethod:(NSString *)method handler:(HOLHolonRPCHandler)handler {
+  if (method.length == 0 || handler == nil) {
+    return;
+  }
+  @synchronized(self) {
+    self.handlers[method] = [handler copy];
+  }
+}
+
+- (void)close {
+  NSDictionary<NSString *, HOLPendingCall *> *pendingSnapshot = nil;
+  NSURLSessionWebSocketTask *taskToClose = nil;
+
+  @synchronized(self) {
+    if (self.closed && !self.connected && self.task == nil) {
+      return;
+    }
+    self.closed = YES;
+    self.connected = NO;
+    self.endpoint = nil;
+    self.reconnectScheduled = NO;
+    self.reconnectAttempt = 0;
+    self.lastConnectionError = HOLMakeError(1005, @"holon-rpc client closed");
+    taskToClose = self.task;
+    self.task = nil;
+    pendingSnapshot = [self.pending copy];
+    [self.pending removeAllObjects];
+  }
+
+  [self stopHeartbeatLocked];
+  dispatch_semaphore_signal(self.stateSignal);
+
+  for (HOLPendingCall *call in pendingSnapshot.allValues) {
+    call.error = HOLMakeError(1005, @"holon-rpc client closed");
+    dispatch_semaphore_signal(call.semaphore);
+  }
+
+  if (taskToClose != nil) {
+    [taskToClose cancelWithCloseCode:NSURLSessionWebSocketCloseCodeNormalClosure
+                              reason:nil];
+  }
+}
+
+- (void)openWebSocket {
+  NSString *endpoint = nil;
+  @synchronized(self) {
+    endpoint = self.endpoint;
+  }
+  if (endpoint.length == 0) {
+    return;
+  }
+
+  NSURL *url = [NSURL URLWithString:endpoint];
+  if (url == nil) {
+    [self handleDisconnectWithError:HOLMakeError(1006, @"invalid websocket url")];
+    return;
+  }
+
+  NSURLSessionWebSocketTask *task =
+      [self.session webSocketTaskWithURL:url protocols:@[ @"holon-rpc" ]];
+  @synchronized(self) {
+    self.task = task;
+  }
+  [task resume];
+}
+
+- (BOOL)waitUntilConnected:(NSInteger)timeoutMS error:(NSError **)error {
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:(double)timeoutMS / 1000.0];
+
+  while (YES) {
+    @synchronized(self) {
+      if (self.connected) {
+        return YES;
+      }
+      if (self.closed) {
+        if (error != NULL) {
+          *error = self.lastConnectionError ?: HOLMakeError(1007, @"holon-rpc client closed");
+        }
+        return NO;
+      }
+    }
+
+    NSTimeInterval remaining = [deadline timeIntervalSinceNow];
+    if (remaining <= 0) {
+      if (error != NULL) {
+        *error = HOLMakeError(1008, @"holon-rpc wait connected timeout");
+      }
+      return NO;
+    }
+
+    dispatch_time_t waitUntil =
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MIN(remaining, 0.05) * NSEC_PER_SEC));
+    dispatch_semaphore_wait(self.stateSignal, waitUntil);
+  }
+}
+
+- (BOOL)sendPayload:(NSDictionary *)payload timeoutMS:(NSInteger)timeoutMS error:(NSError **)error {
+  NSURLSessionWebSocketTask *task = nil;
+  @synchronized(self) {
+    task = self.task;
+  }
+  if (task == nil) {
+    if (error != NULL) {
+      *error = HOLMakeError(1009, @"websocket is not connected");
+    }
+    return NO;
+  }
+
+  NSData *raw = [NSJSONSerialization dataWithJSONObject:payload options:0 error:error];
+  if (raw == nil) {
+    return NO;
+  }
+  NSString *text = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
+  if (text == nil) {
+    if (error != NULL) {
+      *error = HOLMakeError(1010, @"failed to encode payload");
+    }
+    return NO;
+  }
+
+  NSURLSessionWebSocketMessage *msg =
+      [[NSURLSessionWebSocketMessage alloc] initWithString:text];
+  HOLHolonRPCClient *__unsafe_unretained weakSelf = self;
+  [task sendMessage:msg
+  completionHandler:^(NSError *_Nullable taskError) {
+    if (taskError != nil) {
+      HOLHolonRPCClient *selfStrong = weakSelf;
+      if (selfStrong != nil) {
+        [selfStrong handleDisconnectWithError:taskError];
+      }
+    }
+  }];
+
+  return YES;
+}
+
+- (void)receiveNextMessage {
+  NSURLSessionWebSocketTask *task = nil;
+  @synchronized(self) {
+    if (!self.connected || self.closed || self.task == nil) {
+      return;
+    }
+    task = self.task;
+  }
+
+  HOLHolonRPCClient *__unsafe_unretained weakSelf = self;
+  [task receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *_Nullable message,
+                                              NSError *_Nullable error) {
+    HOLHolonRPCClient *selfStrong = weakSelf;
+    if (selfStrong == nil) {
+      return;
+    }
+    if (error != nil) {
+      [selfStrong handleDisconnectWithError:error];
+      return;
+    }
+
+    NSString *text = nil;
+    if (message.type == NSURLSessionWebSocketMessageTypeString) {
+      text = message.string;
+    } else if (message.type == NSURLSessionWebSocketMessageTypeData) {
+      text = [[NSString alloc] initWithData:message.data encoding:NSUTF8StringEncoding];
+    }
+    if (text != nil) {
+      [selfStrong handleIncomingText:text];
+    }
+
+    [selfStrong receiveNextMessage];
+  }];
+}
+
+- (void)handleIncomingText:(NSString *)text {
+  NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+  if (data == nil) {
+    return;
+  }
+
+  NSError *jsonError = nil;
+  id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+  if (jsonError != nil || ![obj isKindOfClass:[NSDictionary class]]) {
+    return;
+  }
+
+  NSDictionary *msg = (NSDictionary *)obj;
+  if (msg[@"method"] != nil) {
+    [self handleIncomingRequest:msg];
+    return;
+  }
+  if (msg[@"result"] != nil || msg[@"error"] != nil) {
+    [self handleIncomingResponse:msg];
+  }
+}
+
+- (void)handleIncomingResponse:(NSDictionary *)msg {
+  NSString *requestID = HOLRPCIDString(msg[@"id"]);
+  if (requestID.length == 0) {
+    return;
+  }
+
+  HOLPendingCall *call = nil;
+  @synchronized(self) {
+    call = self.pending[requestID];
+    [self.pending removeObjectForKey:requestID];
+  }
+  if (call == nil) {
+    return;
+  }
+
+  NSDictionary *errorObj = [msg[@"error"] isKindOfClass:[NSDictionary class]] ? msg[@"error"] : nil;
+  if (errorObj != nil) {
+    NSInteger code = [errorObj[@"code"] respondsToSelector:@selector(integerValue)]
+                         ? [errorObj[@"code"] integerValue]
+                         : -32603;
+    NSString *message = [errorObj[@"message"] isKindOfClass:[NSString class]]
+                            ? errorObj[@"message"]
+                            : @"internal error";
+    call.error = HOLMakeError(code, [NSString stringWithFormat:@"rpc error %ld: %@",
+                                                             (long)code, message]);
+  } else {
+    NSDictionary *result = [msg[@"result"] isKindOfClass:[NSDictionary class]] ? msg[@"result"] : @{};
+    call.result = result;
+  }
+  dispatch_semaphore_signal(call.semaphore);
+}
+
+- (void)handleIncomingRequest:(NSDictionary *)msg {
+  id rawID = msg[@"id"];
+  NSString *method = [msg[@"method"] isKindOfClass:[NSString class]] ? msg[@"method"] : nil;
+  NSString *jsonrpc = [msg[@"jsonrpc"] isKindOfClass:[NSString class]] ? msg[@"jsonrpc"] : nil;
+
+  BOOL hasID = (rawID != nil && rawID != [NSNull null]);
+  if (![jsonrpc isEqualToString:@"2.0"] || method.length == 0) {
+    if (hasID) {
+      [self sendErrorWithID:rawID code:-32600 message:@"invalid request" data:nil];
+    }
+    return;
+  }
+
+  if ([method isEqualToString:@"rpc.heartbeat"]) {
+    if (hasID) {
+      [self sendResultWithID:rawID result:@{}];
+    }
+    return;
+  }
+
+  if (hasID) {
+    NSString *sid = HOLRPCIDString(rawID);
+    if (sid.length == 0 || ![sid hasPrefix:@"s"]) {
+      [self sendErrorWithID:rawID
+                       code:-32600
+                    message:@"server request id must start with 's'"
+                       data:nil];
+      return;
+    }
+  }
+
+  HOLHolonRPCHandler handler = nil;
+  @synchronized(self) {
+    handler = self.handlers[method];
+  }
+  if (handler == nil) {
+    if (hasID) {
+      [self sendErrorWithID:rawID
+                       code:-32601
+                    message:[NSString stringWithFormat:@"method \"%@\" not found", method]
+                       data:nil];
+    }
+    return;
+  }
+
+  NSDictionary *params = [msg[@"params"] isKindOfClass:[NSDictionary class]] ? msg[@"params"] : @{};
+  @try {
+    NSDictionary *result = handler(params ?: @{});
+    if (hasID) {
+      [self sendResultWithID:rawID result:result ?: @{}];
+    }
+  } @catch (NSException *exception) {
+    if (hasID) {
+      [self sendErrorWithID:rawID code:13 message:exception.reason ?: @"internal error" data:nil];
+    }
+  }
+}
+
+- (void)sendResultWithID:(id)rawID result:(NSDictionary *)result {
+  NSDictionary *payload = @{
+    @"jsonrpc" : @"2.0",
+    @"id" : rawID ?: [NSNull null],
+    @"result" : result ?: @{}
+  };
+  [self sendPayload:payload timeoutMS:self.requestTimeoutMS error:nil];
+}
+
+- (void)sendErrorWithID:(id)rawID code:(NSInteger)code message:(NSString *)message data:(id)data {
+  NSMutableDictionary *errorObj = [@{
+    @"code" : @(code),
+    @"message" : message ?: @"internal error",
+  } mutableCopy];
+  if (data != nil) {
+    errorObj[@"data"] = data;
+  }
+  NSDictionary *payload = @{
+    @"jsonrpc" : @"2.0",
+    @"id" : rawID ?: [NSNull null],
+    @"error" : errorObj
+  };
+  [self sendPayload:payload timeoutMS:self.requestTimeoutMS error:nil];
+}
+
+- (void)startHeartbeatLocked {
+  [self stopHeartbeatLocked];
+  if (self.closed || !self.connected) {
+    return;
+  }
+
+  dispatch_source_t timer =
+      dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.timerQueue);
+  if (timer == nil) {
+    return;
+  }
+
+  dispatch_source_set_timer(timer,
+                            dispatch_time(DISPATCH_TIME_NOW, self.heartbeatIntervalMS * NSEC_PER_MSEC),
+                            self.heartbeatIntervalMS * NSEC_PER_MSEC,
+                            50 * NSEC_PER_MSEC);
+  HOLHolonRPCClient *__unsafe_unretained weakSelf = self;
+  dispatch_source_set_event_handler(timer, ^{
+    HOLHolonRPCClient *selfStrong = weakSelf;
+    if (selfStrong == nil) {
+      return;
+    }
+
+    NSError *hbError = nil;
+    [selfStrong invoke:@"rpc.heartbeat" params:@{} timeout:selfStrong.heartbeatTimeoutMS error:&hbError];
+    if (hbError != nil) {
+      [selfStrong forceDisconnect];
+    }
+  });
+  dispatch_resume(timer);
+  self.heartbeatTimer = timer;
+}
+
+- (void)stopHeartbeatLocked {
+  dispatch_source_t timer = nil;
+  @synchronized(self) {
+    timer = self.heartbeatTimer;
+    self.heartbeatTimer = nil;
+  }
+  if (timer != nil) {
+    dispatch_source_cancel(timer);
+  }
+}
+
+- (void)forceDisconnect {
+  NSURLSessionWebSocketTask *task = nil;
+  @synchronized(self) {
+    task = self.task;
+  }
+  if (task != nil) {
+    [task cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil];
+  }
+}
+
+- (void)scheduleReconnect {
+  NSTimeInterval delaySec = 0;
+  @synchronized(self) {
+    if (self.closed || self.reconnectScheduled || self.endpoint.length == 0) {
+      return;
+    }
+    self.reconnectScheduled = YES;
+    double base = MIN(self.reconnectMinDelayMS * pow(self.reconnectFactor, self.reconnectAttempt),
+                      (double)self.reconnectMaxDelayMS);
+    double jitter = base * self.reconnectJitter * ((double)arc4random() / UINT32_MAX);
+    delaySec = (base + jitter) / 1000.0;
+    self.reconnectAttempt += 1;
+  }
+
+  HOLHolonRPCClient *__unsafe_unretained weakSelf = self;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delaySec * NSEC_PER_SEC)),
+                 self.timerQueue, ^{
+                   HOLHolonRPCClient *selfStrong = weakSelf;
+                   if (selfStrong == nil) {
+                     return;
+                   }
+                   @synchronized(selfStrong) {
+                     selfStrong.reconnectScheduled = NO;
+                     if (selfStrong.closed || selfStrong.connected) {
+                       return;
+                     }
+                   }
+                   [selfStrong openWebSocket];
+                 });
+}
+
+- (void)handleDisconnectWithError:(NSError *)error {
+  NSDictionary<NSString *, HOLPendingCall *> *pendingSnapshot = nil;
+  dispatch_semaphore_t connectSem = nil;
+  BOOL shouldReconnect = NO;
+
+  @synchronized(self) {
+    if (self.closed && self.task == nil && !self.connected) {
+      return;
+    }
+
+    self.connected = NO;
+    self.lastConnectionError = error ?: HOLMakeError(1012, @"holon-rpc connection closed");
+    self.task = nil;
+
+    pendingSnapshot = [self.pending copy];
+    [self.pending removeAllObjects];
+
+    connectSem = self.connectSemaphore;
+    shouldReconnect = !self.closed;
+  }
+
+  [self stopHeartbeatLocked];
+
+  for (HOLPendingCall *call in pendingSnapshot.allValues) {
+    call.error = self.lastConnectionError;
+    dispatch_semaphore_signal(call.semaphore);
+  }
+  if (connectSem != nil) {
+    dispatch_semaphore_signal(connectSem);
+  }
+  dispatch_semaphore_signal(self.stateSignal);
+
+  if (shouldReconnect) {
+    [self scheduleReconnect];
+  }
+}
+
+#pragma mark - NSURLSession Delegate
+
+- (void)URLSession:(NSURLSession *)session
+    webSocketTask:(NSURLSessionWebSocketTask *)webSocketTask
+didOpenWithProtocol:(NSString *)protocol {
+  if (protocol.length == 0 || ![protocol isEqualToString:@"holon-rpc"]) {
+    [self handleDisconnectWithError:HOLMakeError(1013, @"server did not negotiate holon-rpc")];
+    [webSocketTask cancelWithCloseCode:NSURLSessionWebSocketCloseCodeProtocolError reason:nil];
+    return;
+  }
+
+  dispatch_semaphore_t connectSem = nil;
+  @synchronized(self) {
+    self.connected = YES;
+    self.lastConnectionError = nil;
+    self.reconnectAttempt = 0;
+    self.reconnectScheduled = NO;
+    self.task = webSocketTask;
+    connectSem = self.connectSemaphore;
+  }
+
+  if (connectSem != nil) {
+    dispatch_semaphore_signal(connectSem);
+  }
+  dispatch_semaphore_signal(self.stateSignal);
+  [self startHeartbeatLocked];
+  [self receiveNextMessage];
+}
+
+- (void)URLSession:(NSURLSession *)session
+    webSocketTask:(NSURLSessionWebSocketTask *)webSocketTask
+didCloseWithCode:(NSURLSessionWebSocketCloseCode)closeCode
+           reason:(NSData *)reason {
+  [self handleDisconnectWithError:nil];
+}
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didCompleteWithError:(NSError *)error {
+  if (error != nil) {
+    [self handleDisconnectWithError:error];
+  }
+}
+
 @end
 
 NSString *HOLScheme(NSString *uri) {

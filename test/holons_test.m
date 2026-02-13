@@ -1,8 +1,10 @@
 #import "../include/Holons/Holons.h"
 #import <Foundation/Foundation.h>
 #include <arpa/inet.h>
+#include <signal.h>
 #include <netinet/in.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -48,6 +50,143 @@ static int connect_tcp(const char *host, int port) {
   }
 
   return fd;
+}
+
+static NSString *resolve_go_binary(void) {
+  NSString *preferred = @"/Users/bpds/go/go1.25.1/bin/go";
+  if ([[NSFileManager defaultManager] isExecutableFileAtPath:preferred]) {
+    return preferred;
+  }
+  return @"go";
+}
+
+static NSString *find_sdk_dir(void) {
+  NSFileManager *fm = [NSFileManager defaultManager];
+  NSString *dir = [[fm currentDirectoryPath] copy];
+
+  for (NSInteger i = 0; i < 12; i++) {
+    NSString *candidate = [dir stringByAppendingPathComponent:@"go-holons"];
+    BOOL isDir = NO;
+    if ([fm fileExistsAtPath:candidate isDirectory:&isDir] && isDir) {
+      return dir;
+    }
+    dir = [dir stringByDeletingLastPathComponent];
+    if (dir.length == 0 || [dir isEqualToString:@"/"]) {
+      break;
+    }
+  }
+
+  return nil;
+}
+
+static NSString *read_line_with_timeout(NSFileHandle *handle, NSTimeInterval timeout) {
+  dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+  __block NSString *line = nil;
+
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    NSMutableData *data = [NSMutableData data];
+    while (YES) {
+      NSData *chunk = [handle readDataOfLength:1];
+      if (chunk.length == 0) {
+        break;
+      }
+      uint8_t byte = ((const uint8_t *)chunk.bytes)[0];
+      if (byte == '\n') {
+        break;
+      }
+      [data appendData:chunk];
+    }
+    if (data.length > 0) {
+      line = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    }
+    dispatch_semaphore_signal(sem);
+  });
+
+  long rc = dispatch_semaphore_wait(
+      sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
+  if (rc != 0) {
+    return nil;
+  }
+  return line;
+}
+
+static NSDictionary *invoke_eventually(HOLHolonRPCClient *client, NSString *method,
+                                       NSDictionary *params) {
+  for (NSInteger i = 0; i < 40; i++) {
+    NSError *error = nil;
+    NSDictionary *out = [client invoke:method params:params timeout:10000 error:&error];
+    if (out != nil && error == nil) {
+      return out;
+    }
+    [NSThread sleepForTimeInterval:0.12];
+  }
+  return nil;
+}
+
+static BOOL with_go_helper(NSString *mode, void (^block)(NSString *url)) {
+  NSFileManager *fm = [NSFileManager defaultManager];
+  NSString *sdkDir = find_sdk_dir();
+  if (sdkDir.length == 0) {
+    NSLog(@"FAIL: unable to locate sdk directory containing go-holons");
+    return NO;
+  }
+  NSString *goDir = [sdkDir stringByAppendingPathComponent:@"go-holons"];
+  NSString *fixturePath = @"test/fixtures/go_holonrpc_helper.go";
+
+  NSData *fixtureData = [NSData dataWithContentsOfFile:fixturePath];
+  if (fixtureData == nil) {
+    NSLog(@"FAIL: missing fixture %@", fixturePath);
+    return NO;
+  }
+
+  NSString *helperPath = [goDir stringByAppendingPathComponent:
+                                    [NSString stringWithFormat:@"tmp-holonrpc-%@.go",
+                                                               [[NSUUID UUID] UUIDString]]];
+  if (![fixtureData writeToFile:helperPath atomically:YES]) {
+    NSLog(@"FAIL: unable to write helper file %@", helperPath);
+    return NO;
+  }
+
+  NSPipe *stdoutPipe = [NSPipe pipe];
+  NSPipe *stderrPipe = [NSPipe pipe];
+
+  NSTask *task = [NSTask new];
+  task.launchPath = resolve_go_binary();
+  task.arguments = @[ @"run", helperPath, mode ];
+  task.currentDirectoryPath = goDir;
+  task.standardOutput = stdoutPipe;
+  task.standardError = stderrPipe;
+
+  @try {
+    [task launch];
+  } @catch (NSException *exception) {
+    NSLog(@"FAIL: unable to launch go helper: %@", exception.reason);
+    [fm removeItemAtPath:helperPath error:nil];
+    return NO;
+  }
+
+  NSString *url = read_line_with_timeout(stdoutPipe.fileHandleForReading, 20.0);
+  if (url.length == 0) {
+    NSData *stderrData = [stderrPipe.fileHandleForReading readDataToEndOfFile];
+    NSString *stderrText =
+        [[NSString alloc] initWithData:stderrData encoding:NSUTF8StringEncoding];
+    NSLog(@"FAIL: Go helper did not output URL: %@", stderrText ?: @"");
+    if (task.isRunning) {
+      [task terminate];
+    }
+    [task waitUntilExit];
+    [fm removeItemAtPath:helperPath error:nil];
+    return NO;
+  }
+
+  block(url);
+
+  if (task.isRunning) {
+    [task terminate];
+  }
+  [task waitUntilExit];
+  [fm removeItemAtPath:helperPath error:nil];
+  return YES;
 }
 
 int main(int argc, const char *argv[]) {
@@ -189,6 +328,97 @@ int main(int argc, const char *argv[]) {
     assert_true(noFM == nil, @"missing frontmatter fails");
     assert_true(error != nil, @"missing frontmatter error");
     [[NSFileManager defaultManager] removeItemAtPath:noFMPath error:nil];
+
+    // Holon-RPC interop
+    BOOL rpcEcho = with_go_helper(@"echo", ^(NSString *url) {
+      HOLHolonRPCClient *client = [[HOLHolonRPCClient alloc]
+          initWithHeartbeatIntervalMS:250
+                   heartbeatTimeoutMS:250
+                  reconnectMinDelayMS:100
+                  reconnectMaxDelayMS:400
+                      reconnectFactor:2.0
+                      reconnectJitter:0.1
+                     connectTimeoutMS:10000
+                     requestTimeoutMS:10000];
+      NSError *rpcError = nil;
+      BOOL ok = [client connect:url error:&rpcError];
+      assert_true(ok && rpcError == nil, @"holon-rpc connect echo");
+
+      NSDictionary *out = [client invoke:@"echo.v1.Echo/Ping"
+                                  params:@{ @"message" : @"hello" }
+                                   error:&rpcError];
+      assert_true(out != nil && rpcError == nil, @"holon-rpc invoke echo");
+      assert_eq(@"hello", out[@"message"], @"holon-rpc echo result");
+      [client close];
+    });
+    assert_true(rpcEcho, @"holon-rpc helper echo");
+
+    BOOL rpcCallClient = with_go_helper(@"echo", ^(NSString *url) {
+      HOLHolonRPCClient *client = [[HOLHolonRPCClient alloc]
+          initWithHeartbeatIntervalMS:250
+                   heartbeatTimeoutMS:250
+                  reconnectMinDelayMS:100
+                  reconnectMaxDelayMS:400
+                      reconnectFactor:2.0
+                      reconnectJitter:0.1
+                     connectTimeoutMS:10000
+                     requestTimeoutMS:10000];
+
+      [client registerMethod:@"client.v1.Client/Hello"
+                     handler:^NSDictionary *_Nonnull(NSDictionary<NSString *,id> *_Nonnull params) {
+                       NSString *name = [params[@"name"] isKindOfClass:[NSString class]]
+                                            ? params[@"name"]
+                                            : @"";
+                       return @{ @"message" : [NSString stringWithFormat:@"hello %@", name] };
+                     }];
+
+      NSError *rpcError = nil;
+      BOOL ok = [client connect:url error:&rpcError];
+      assert_true(ok && rpcError == nil, @"holon-rpc connect call-client");
+
+      NSDictionary *out = [client invoke:@"echo.v1.Echo/CallClient"
+                                  params:@{}
+                                   error:&rpcError];
+      assert_true(out != nil && rpcError == nil, @"holon-rpc invoke call-client");
+      assert_eq(@"hello go", out[@"message"], @"holon-rpc call-client result");
+      [client close];
+    });
+    assert_true(rpcCallClient, @"holon-rpc helper call-client");
+
+    BOOL rpcReconnect = with_go_helper(@"drop-once", ^(NSString *url) {
+      HOLHolonRPCClient *client = [[HOLHolonRPCClient alloc]
+          initWithHeartbeatIntervalMS:200
+                   heartbeatTimeoutMS:200
+                  reconnectMinDelayMS:100
+                  reconnectMaxDelayMS:400
+                      reconnectFactor:2.0
+                      reconnectJitter:0.1
+                     connectTimeoutMS:10000
+                     requestTimeoutMS:10000];
+
+      NSError *rpcError = nil;
+      BOOL ok = [client connect:url error:&rpcError];
+      assert_true(ok && rpcError == nil, @"holon-rpc connect drop-once");
+
+      NSDictionary *first = [client invoke:@"echo.v1.Echo/Ping"
+                                    params:@{ @"message" : @"first" }
+                                     error:&rpcError];
+      assert_true(first != nil && rpcError == nil, @"holon-rpc first ping");
+      assert_eq(@"first", first[@"message"], @"holon-rpc first payload");
+
+      [NSThread sleepForTimeInterval:0.7];
+
+      NSDictionary *second = invoke_eventually(client, @"echo.v1.Echo/Ping",
+                                               @{ @"message" : @"second" });
+      assert_true(second != nil, @"holon-rpc second ping");
+      assert_eq(@"second", second[@"message"], @"holon-rpc second payload");
+
+      NSDictionary *hb = invoke_eventually(client, @"echo.v1.Echo/HeartbeatCount", @{});
+      NSNumber *count = [hb[@"count"] isKindOfClass:[NSNumber class]] ? hb[@"count"] : @(0);
+      assert_true(count.integerValue >= 1, @"holon-rpc heartbeat count");
+      [client close];
+    });
+    assert_true(rpcReconnect, @"holon-rpc helper reconnect");
 
     NSLog(@"%d passed, %d failed", passed, failed);
     return failed > 0 ? 1 : 0;

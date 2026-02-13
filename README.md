@@ -12,8 +12,8 @@ status: draft
 ---
 # objc-holons
 
-**Objective-C SDK for Organic Programming** — transport, serve, and identity utilities
-for building holons in Objective-C.
+**Objective-C SDK for Organic Programming** — transport, serve, identity,
+and Holon-RPC client utilities for building holons in Objective-C.
 
 ## Build & Test
 
@@ -36,6 +36,7 @@ clang -framework Foundation -I include src/Holons.m test/holons_test.m -o test_r
 | `HOLParseFlags(args)` | CLI arg extraction |
 | `HOLParseHolon(path, &error)` | Parse HOLON.md YAML frontmatter into `HOLHolonIdentity` |
 | `HOLCloseListener(listener)` | Close/cleanup listener resources |
+| `HOLHolonRPCClient` | `connect(url)`, `invoke(method, params)`, `registerMethod(method, handler)`, `close()` |
 
 ## Transport support
 
@@ -55,6 +56,7 @@ Implemented parity:
 - URI parsing and listener dispatch semantics
 - Runtime accept path for `tcp`, `unix`, `stdio`, and `mem`
 - In-process `mem://` client/server connection pair (`HOLMemDial` + `HOLAccept`)
+- Holon-RPC client protocol support over `ws://` / `wss://` (JSON-RPC 2.0, heartbeat, reconnect)
 - Standard serve flag parsing
 - HOLON identity parsing
 
@@ -63,5 +65,5 @@ Not yet achievable in this minimal Objective-C core (justified gaps):
 - `ws://` / `wss://` runtime listener parity:
   - Exposed as metadata only.
   - A full Go-style WebSocket runtime listener would require additional HTTP/WebSocket runtime integration not yet included.
-- Transport-agnostic gRPC client helpers (`Dial`, `DialStdio`, `DialMem`, `DialWebSocket`):
-  - Not present yet; requires dedicated gRPC integration layer for Objective-C.
+- Full gRPC transport parity (`Dial("tcp://...")`, `Dial("stdio://...")`, `Listen("stdio://...")`, and `Serve.Run()` wiring):
+  - Not present yet; requires a dedicated Objective-C gRPC integration layer and stdio transport adaptation.
