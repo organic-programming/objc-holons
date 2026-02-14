@@ -21,12 +21,14 @@
     "valence": "multi",
     "routing": [
       "unicast",
-      "fanout"
+      "fanout",
+      "broadcast-response",
+      "full-broadcast"
     ]
   },
   "last_certified": {
-    "commit": "b7a4579cbd7a42b3a81f47bb3d193d7455d3d6a4",
-    "date": "2026-02-14",
+    "commit": "",
+    "date": "",
     "level": 0
   }
 }
