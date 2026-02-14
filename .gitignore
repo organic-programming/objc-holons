@@ -1,3 +1,9 @@
 test_runner
 
 bin/
+
+*.dSYM/
+
+*.xcodeproj/xcuserdata/
+
+*.xcworkspace/xcuserdata/
