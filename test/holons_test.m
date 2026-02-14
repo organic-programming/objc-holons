@@ -114,13 +114,40 @@ static void test_certification_contract(void) {
     return;
   }
 
-  assert_true([raw containsString:@"\"echo_server\": \"./bin/echo-server\""],
-              @"cert echo_server declaration");
-  assert_true([raw containsString:@"\"echo_client\": \"./bin/echo-client\""],
-              @"cert echo_client declaration");
-  assert_true([raw containsString:@"\"grpc_dial_tcp\": true"],
+  NSData *rawData = [raw dataUsingEncoding:NSUTF8StringEncoding];
+  assert_true(rawData != nil, @"cert json data");
+  if (rawData == nil) {
+    return;
+  }
+
+  NSError *jsonError = nil;
+  NSDictionary<NSString *, id> *cert = [NSJSONSerialization JSONObjectWithData:rawData
+                                                                        options:0
+                                                                          error:&jsonError];
+  assert_true(cert != nil && jsonError == nil, @"parse cert.json");
+  if (cert == nil || jsonError != nil) {
+    return;
+  }
+
+  NSDictionary<NSString *, id> *executables = cert[@"executables"];
+  assert_true([executables isKindOfClass:[NSDictionary class]], @"cert executables object");
+  if (![executables isKindOfClass:[NSDictionary class]]) {
+    return;
+  }
+  assert_eq(@"./bin/echo-server", executables[@"echo_server"], @"cert echo_server declaration");
+  assert_eq(@"./bin/echo-client", executables[@"echo_client"], @"cert echo_client declaration");
+
+  NSDictionary<NSString *, id> *capabilities = cert[@"capabilities"];
+  assert_true([capabilities isKindOfClass:[NSDictionary class]], @"cert capabilities object");
+  if (![capabilities isKindOfClass:[NSDictionary class]]) {
+    return;
+  }
+
+  NSNumber *dialTCP = capabilities[@"grpc_dial_tcp"];
+  NSNumber *dialStdio = capabilities[@"grpc_dial_stdio"];
+  assert_true([dialTCP isKindOfClass:[NSNumber class]] && [dialTCP boolValue],
               @"cert grpc_dial_tcp declaration");
-  assert_true([raw containsString:@"\"grpc_dial_stdio\": true"],
+  assert_true([dialStdio isKindOfClass:[NSNumber class]] && [dialStdio boolValue],
               @"cert grpc_dial_stdio declaration");
 }
 
