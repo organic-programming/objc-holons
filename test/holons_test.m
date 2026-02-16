@@ -57,6 +57,44 @@ static int command_exit_code(const char *cmd) {
   return WEXITSTATUS(status);
 }
 
+static int run_bash_script(NSString *script) {
+  if (script.length == 0) {
+    return -1;
+  }
+
+  char scriptTemplate[] = "/tmp/holons_objc_script_XXXXXX";
+  int scriptFD = mkstemp(scriptTemplate);
+  if (scriptFD < 0) {
+    return -1;
+  }
+
+  FILE *scriptFile = fdopen(scriptFD, "w");
+  if (scriptFile == NULL) {
+    close(scriptFD);
+    unlink(scriptTemplate);
+    return -1;
+  }
+
+  const char *raw = script.UTF8String;
+  size_t length = strlen(raw);
+  size_t wrote = fwrite(raw, 1, length, scriptFile);
+  int closeRC = fclose(scriptFile);
+  if (wrote != length || closeRC != 0) {
+    unlink(scriptTemplate);
+    return -1;
+  }
+
+  if (chmod(scriptTemplate, 0700) != 0) {
+    unlink(scriptTemplate);
+    return -1;
+  }
+
+  NSString *command = [NSString stringWithFormat:@"/bin/bash %s", scriptTemplate];
+  int rc = command_exit_code(command.UTF8String);
+  unlink(scriptTemplate);
+  return rc;
+}
+
 static NSString *env_string(NSString *name) {
   const char *value = getenv(name.UTF8String);
   if (value == NULL) {
@@ -251,11 +289,21 @@ static void test_echo_wrapper_invocation(void) {
     assert_true([capture containsString:@"PWD="] && [capture containsString:@"/sdk/go-holons"],
                 @"echo-server wrapper cwd");
     assert_true([capture containsString:@"ARG0=run"], @"echo-server wrapper uses go run");
-    assert_true([capture containsString:@"ARG1=./cmd/echo-server"], @"echo-server wrapper command path");
+    assert_true([capture containsString:@"echo-server-go/main.go"], @"echo-server wrapper helper path");
     assert_true([capture containsString:@"--sdk"] && [capture containsString:@"objc-holons"],
                 @"echo-server wrapper sdk default");
     assert_true([capture containsString:@"--listen"] && [capture containsString:@"stdio://"],
                 @"echo-server wrapper forwards listen URI");
+  }
+
+  serverExit =
+      command_exit_code("./bin/echo-server --sleep-ms 250 --listen stdio:// >/dev/null 2>&1");
+  assert_true(serverExit == 0, @"echo-server wrapper sleep flag exit");
+  capture = read_file_text(logPath);
+  assert_true(capture.length > 0, @"read echo-server wrapper sleep capture");
+  if (capture.length > 0) {
+    assert_true([capture containsString:@"--sleep-ms"] && [capture containsString:@"250"],
+                @"echo-server wrapper forwards sleep-ms");
   }
 
   serverExit = command_exit_code("./bin/echo-server serve --listen stdio:// >/dev/null 2>&1");
@@ -677,6 +725,43 @@ int main(int argc, const char *argv[]) {
           "./bin/echo-client --server-sdk objc-holons --message cert-ws "
           "ws://127.0.0.1:0/grpc >/dev/null 2>&1");
       assert_true(wsExit == 0, @"echo-client ws runtime");
+
+      NSString *timeoutScript =
+          @"set -euo pipefail\n"
+           "cleanup() {\n"
+           "  if [ -n \"${S_PID:-}\" ] && kill -0 \"$S_PID\" >/dev/null 2>&1; then\n"
+           "    kill -TERM \"$S_PID\" >/dev/null 2>&1 || true\n"
+           "    wait \"$S_PID\" >/dev/null 2>&1 || true\n"
+           "  fi\n"
+           "  rm -f \"${S_OUT:-}\" \"${S_ERR:-}\" \"${TIME_OUT:-}\" \"${TIME_ERR:-}\"\n"
+           "}\n"
+           "trap cleanup EXIT\n"
+           "S_OUT=$(mktemp)\n"
+           "S_ERR=$(mktemp)\n"
+           "./bin/echo-server --sleep-ms 1800 --listen tcp://127.0.0.1:0 >\"$S_OUT\" 2>\"$S_ERR\" &\n"
+           "S_PID=$!\n"
+           "ADDR=\"\"\n"
+           "for _ in $(seq 1 120); do\n"
+           "  if [ -s \"$S_OUT\" ]; then\n"
+           "    ADDR=$(head -n1 \"$S_OUT\" | tr -d '\\r\\n')\n"
+           "    if [ -n \"$ADDR\" ]; then break; fi\n"
+           "  fi\n"
+           "  sleep 0.05\n"
+           "done\n"
+           "[ -n \"$ADDR\" ]\n"
+           "TIME_OUT=$(mktemp)\n"
+           "TIME_ERR=$(mktemp)\n"
+           "set +e\n"
+           "./bin/echo-client --server-sdk objc-holons --timeout-ms 500 --message cert-l5-timeout \"$ADDR\" >\"$TIME_OUT\" 2>\"$TIME_ERR\"\n"
+           "TIME_RC=$?\n"
+           "set -e\n"
+           "[ \"$TIME_RC\" -ne 0 ]\n"
+           "grep -Eiq 'DeadlineExceeded|deadline exceeded' \"$TIME_ERR\"\n"
+           "./bin/echo-client --server-sdk objc-holons --timeout-ms 5000 --message cert-l5-timeout-followup \"$ADDR\" >/dev/null 2>&1\n"
+           "kill -TERM \"$S_PID\" >/dev/null 2>&1 || true\n"
+           "wait \"$S_PID\" >/dev/null 2>&1 || true\n";
+      int timeoutProbe = run_bash_script(timeoutScript);
+      assert_true(timeoutProbe == 0, @"echo timeout propagation runtime");
     } else {
       skip_test([NSString stringWithFormat:@"cert runtime transport checks skipped (%@)",
                                            bindReason.length > 0 ? bindReason
