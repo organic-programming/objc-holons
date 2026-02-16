@@ -1,32 +1,32 @@
 {
-  "sdk": "objc-holons",
-  "lang": "objc",
-  "version": "0.1.0",
-  "executables": {
-    "echo_server": "./bin/echo-server",
-    "echo_client": "./bin/echo-client"
-  },
   "capabilities": {
-    "grpc_listen_tcp": true,
-    "grpc_listen_stdio": true,
-    "grpc_listen_unix": true,
-    "grpc_listen_mem": true,
-    "grpc_dial_tcp": true,
+    "bidirectional": true,
     "grpc_dial_stdio": true,
+    "grpc_dial_tcp": true,
     "grpc_dial_unix": false,
     "grpc_dial_ws": false,
+    "grpc_listen_mem": true,
+    "grpc_listen_stdio": true,
+    "grpc_listen_tcp": true,
+    "grpc_listen_unix": true,
     "holon_rpc_client": true,
     "holon_rpc_server": false,
-    "bidirectional": true,
-    "valence": "multi",
     "routing": [
       "unicast"
-    ]
+    ],
+    "valence": "multi"
   },
+  "executables": {
+    "echo_client": "./bin/echo-client",
+    "echo_server": "./bin/echo-server"
+  },
+  "lang": "objc",
   "last_certified": {
-    "commit": "",
-    "date": "",
-    "level": 0
+    "commit": "58cee92c602edacfd544a4aa0300e53610dd1311",
+    "date": "2026-02-16",
+    "level": 1
   },
-  "role": "client"
+  "role": "client",
+  "sdk": "objc-holons",
+  "version": "0.1.0"
 }
