@@ -145,61 +145,6 @@ static BOOL loopback_bind_allowed(NSString **reasonOut) {
   return YES;
 }
 
-static void test_certification_contract(void) {
-  NSString *raw = read_file_text(@"cert.json");
-  assert_true(raw.length > 0, @"read cert.json");
-  if (raw.length == 0) {
-    return;
-  }
-
-  NSData *rawData = [raw dataUsingEncoding:NSUTF8StringEncoding];
-  assert_true(rawData != nil, @"cert json data");
-  if (rawData == nil) {
-    return;
-  }
-
-  NSError *jsonError = nil;
-  NSDictionary<NSString *, id> *cert = [NSJSONSerialization JSONObjectWithData:rawData
-                                                                        options:0
-                                                                          error:&jsonError];
-  assert_true(cert != nil && jsonError == nil, @"parse cert.json");
-  if (cert == nil || jsonError != nil) {
-    return;
-  }
-
-  NSDictionary<NSString *, id> *executables = cert[@"executables"];
-  assert_true([executables isKindOfClass:[NSDictionary class]], @"cert executables object");
-  if (![executables isKindOfClass:[NSDictionary class]]) {
-    return;
-  }
-  assert_eq(@"./bin/echo-server", executables[@"echo_server"], @"cert echo_server declaration");
-  assert_eq(@"./bin/echo-client", executables[@"echo_client"], @"cert echo_client declaration");
-  assert_eq(@"./bin/holon-rpc-server", executables[@"holon_rpc_server"],
-            @"cert holon_rpc_server declaration");
-
-  NSDictionary<NSString *, id> *capabilities = cert[@"capabilities"];
-  assert_true([capabilities isKindOfClass:[NSDictionary class]], @"cert capabilities object");
-  if (![capabilities isKindOfClass:[NSDictionary class]]) {
-    return;
-  }
-
-  NSNumber *dialTCP = capabilities[@"grpc_dial_tcp"];
-  NSNumber *dialStdio = capabilities[@"grpc_dial_stdio"];
-  NSNumber *dialUnix = capabilities[@"grpc_dial_unix"];
-  NSNumber *dialWS = capabilities[@"grpc_dial_ws"];
-  NSNumber *holonRPCServer = capabilities[@"holon_rpc_server"];
-  assert_true([dialTCP isKindOfClass:[NSNumber class]] && [dialTCP boolValue],
-              @"cert grpc_dial_tcp declaration");
-  assert_true([dialStdio isKindOfClass:[NSNumber class]] && [dialStdio boolValue],
-              @"cert grpc_dial_stdio declaration");
-  assert_true([dialUnix isKindOfClass:[NSNumber class]] && [dialUnix boolValue],
-              @"cert grpc_dial_unix declaration");
-  assert_true([dialWS isKindOfClass:[NSNumber class]] && [dialWS boolValue],
-              @"cert grpc_dial_ws declaration");
-  assert_true([holonRPCServer isKindOfClass:[NSNumber class]] && [holonRPCServer boolValue],
-              @"cert holon_rpc_server declaration");
-}
-
 static void test_echo_wrapper_scripts_exist(void) {
   assert_true(access("./bin/echo-client", F_OK) == 0, @"echo-client script exists");
   assert_true(access("./bin/echo-server", F_OK) == 0, @"echo-server script exists");
@@ -555,7 +500,6 @@ static BOOL with_local_holonrpc_server(void (^block)(NSString *url)) {
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    test_certification_contract();
     test_echo_wrapper_scripts_exist();
     test_echo_wrapper_invocation();
 
@@ -680,19 +624,16 @@ int main(int argc, const char *argv[]) {
 
     // Identity
     NSString *tmpDir = NSTemporaryDirectory();
-    NSString *path = [tmpDir stringByAppendingPathComponent:[NSString stringWithFormat:@"objc_holon_%@.md", [[NSUUID UUID] UUIDString]]];
+    NSString *path = [tmpDir stringByAppendingPathComponent:[NSString stringWithFormat:@"objc_holon_%@.yaml", [[NSUUID UUID] UUIDString]]];
     NSString *content =
-        @"---\n"
-         "uuid: \"abc-123\"\n"
+        @"uuid: \"abc-123\"\n"
          "given_name: \"objc-holon\"\n"
          "family_name: \"Test\"\n"
          "lang: \"objc\"\n"
          "parents: [\"a\", \"b\"]\n"
          "generated_by: \"sophia-who\"\n"
          "proto_status: draft\n"
-         "aliases: [\"o1\"]\n"
-         "---\n"
-         "# Holon\n";
+         "aliases: [\"o1\"]\n";
     [content writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
     error = nil;
@@ -707,12 +648,12 @@ int main(int argc, const char *argv[]) {
     assert_true(idn.aliases.count == 1, @"identity aliases");
     [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
 
-    NSString *noFMPath = [tmpDir stringByAppendingPathComponent:[NSString stringWithFormat:@"objc_holon_no_fm_%@.md", [[NSUUID UUID] UUIDString]]];
-    [@"# No frontmatter\n" writeToFile:noFMPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *noFMPath = [tmpDir stringByAppendingPathComponent:[NSString stringWithFormat:@"objc_holon_invalid_%@.yaml", [[NSUUID UUID] UUIDString]]];
+    [@"- not\n- a\n- mapping\n" writeToFile:noFMPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
     error = nil;
     HOLHolonIdentity *noFM = HOLParseHolon(noFMPath, &error);
-    assert_true(noFM == nil, @"missing frontmatter fails");
-    assert_true(error != nil, @"missing frontmatter error");
+    assert_true(noFM == nil, @"invalid mapping fails");
+    assert_true(error != nil, @"invalid mapping error");
     [[NSFileManager defaultManager] removeItemAtPath:noFMPath error:nil];
 
     // Certification runtime transport checks

@@ -139,7 +139,7 @@ void HOLCloseConnection(HOLConnection *connection);
 /// Parse --listen or --port from command-line args.
 NSString *HOLParseFlags(NSArray<NSString *> *args);
 
-/// Parse HOLON.md identity YAML frontmatter.
+/// Parse a holon.yaml identity mapping.
 HOLHolonIdentity *_Nullable HOLParseHolon(NSString *path,
                                           NSError *_Nullable *_Nullable error);
 

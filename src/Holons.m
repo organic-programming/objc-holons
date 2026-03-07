@@ -1252,23 +1252,7 @@ HOLHolonIdentity *HOLParseHolon(NSString *path, NSError **error) {
     return nil;
   }
 
-  if (![text hasPrefix:@"---"]) {
-    if (error != NULL) {
-      *error = HOLMakeError(20, [NSString stringWithFormat:@"%@: missing YAML frontmatter", path]);
-    }
-    return nil;
-  }
-
-  NSRange end = [text rangeOfString:@"---" options:0 range:NSMakeRange(3, text.length - 3)];
-  if (end.location == NSNotFound) {
-    if (error != NULL) {
-      *error = HOLMakeError(21, [NSString stringWithFormat:@"%@: unterminated frontmatter", path]);
-    }
-    return nil;
-  }
-
-  NSString *frontmatter = [text substringWithRange:NSMakeRange(3, end.location - 3)];
-  NSArray<NSString *> *lines = [frontmatter componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+  NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
 
   HOLHolonIdentity *identity = [HOLHolonIdentity new];
   identity.uuid = @"";
@@ -1286,10 +1270,14 @@ HOLHolonIdentity *HOLParseHolon(NSString *path, NSError **error) {
   identity.protoStatus = @"";
   identity.aliases = @[];
 
+  BOOL sawMapping = NO;
   for (NSString *rawLine in lines) {
     NSString *line = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
     if (line.length == 0 || [line hasPrefix:@"#"]) {
       continue;
+    }
+    if ([line containsString:@":"]) {
+      sawMapping = YES;
     }
 
     if ([line hasPrefix:@"uuid:"]) {
@@ -1321,6 +1309,13 @@ HOLHolonIdentity *HOLParseHolon(NSString *path, NSError **error) {
     } else if ([line hasPrefix:@"aliases:"]) {
       identity.aliases = HOLYAMLList(HOLYAMLValue(line));
     }
+  }
+
+  if (!sawMapping) {
+    if (error != NULL) {
+      *error = HOLMakeError(20, [NSString stringWithFormat:@"%@: holon.yaml must be a YAML mapping", path]);
+    }
+    return nil;
   }
 
   return identity;
