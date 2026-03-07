@@ -1,7 +1,8 @@
 # objc-holons
 
-**Objective-C SDK for Organic Programming** — transport, serve, identity,
-and Holon-RPC client utilities for building holons in Objective-C.
+**Objective-C SDK for Organic Programming** — transport primitives,
+serve-flag parsing, identity parsing, discovery, and a Holon-RPC
+client.
 
 ## Build & Test
 
@@ -14,44 +15,27 @@ clang -framework Foundation -I include src/Holons.m test/holons_test.m -o test_r
 | Symbol | Description |
 |--------|-------------|
 | `HOLParseURI(uri)` | Parse transport URI into normalized fields |
-| `HOLListen(uri, &error)` | Create listener variant (`HOLTcpListener`, `HOLUnixListener`, `HOLStdioListener`, `HOLMemListener`, `HOLWSListener`) |
-| `HOLAccept(listener, &error)` | Accept one runtime connection (`tcp`, `unix`, `stdio`, `mem`) |
+| `HOLListen(uri, &error)` | Create a listener variant |
+| `HOLAccept(listener, &error)` | Accept one runtime connection |
 | `HOLMemDial(listener, &error)` | Dial the client side of a `mem://` listener |
-| `HOLConnectionRead(conn, buf, n)` | Read from connection |
-| `HOLConnectionWrite(conn, buf, n)` | Write to connection |
-| `HOLCloseConnection(conn)` | Close connection resources |
 | `HOLScheme(uri)` | Extract transport scheme |
 | `HOLParseFlags(args)` | CLI arg extraction |
-| `HOLParseHolon(path, &error)` | Parse holon.yaml into `HOLHolonIdentity` |
-| `HOLCloseListener(listener)` | Close/cleanup listener resources |
-| `HOLHolonRPCClient` | `connect(url)`, `invoke(method, params)`, `registerMethod(method, handler)`, `close()` |
+| `HOLParseHolon(path, &error)` | Parse `holon.yaml` into `HOLHolonIdentity` |
+| `HOLDiscover(root, &error)` | Discover holons under a root |
+| `HOLDiscoverLocal(&error)` | Discover from the current working directory |
+| `HOLDiscoverAll(&error)` | Discover from local, `$OPBIN`, and cache roots |
+| `HOLFindBySlug(slug, &error)` | Resolve a holon by slug |
+| `HOLFindByUUID(prefix, &error)` | Resolve a holon by UUID prefix |
+| `HOLHolonRPCClient` | Holon-RPC client |
 
-## Transport support
+## Current scope
 
-| Scheme | Support |
-|--------|---------|
-| `tcp://<host>:<port>` | Bound socket (`HOLTcpListener`) |
-| `unix://<path>` | Bound UNIX socket (`HOLUnixListener`) |
-| `stdio://` | Native runtime accept (single-connection semantics) |
-| `mem://` | Native runtime in-process pair (`HOLMemDial` + `HOLAccept`) |
-| `ws://<host>:<port>` | Listener metadata (`HOLWSListener`) |
-| `wss://<host>:<port>` | Listener metadata (`HOLWSListener`) |
+- Runtime transports: `tcp://`, `unix://`, `stdio://`, `mem://`
+- `ws://` and `wss://` are metadata-only at the transport layer
+- Discovery scans local, `$OPBIN`, and cache roots
 
-## Parity Notes vs Go Reference
+## Current gaps vs Go
 
-Implemented parity:
-
-- URI parsing and listener dispatch semantics
-- Runtime accept path for `tcp`, `unix`, `stdio`, and `mem`
-- In-process `mem://` client/server connection pair (`HOLMemDial` + `HOLAccept`)
-- Holon-RPC client protocol support over `ws://` / `wss://` (JSON-RPC 2.0, heartbeat, reconnect)
-- Standard serve flag parsing
-- HOLON identity parsing
-
-Not yet achievable in this minimal Objective-C core (justified gaps):
-
-- `ws://` / `wss://` runtime listener parity:
-  - Exposed as metadata only.
-  - A full Go-style WebSocket runtime listener would require additional HTTP/WebSocket runtime integration not yet included.
-- Full gRPC transport parity (`Dial("tcp://...")`, `Dial("stdio://...")`, `Listen("stdio://...")`, and `Serve.Run()` wiring):
-  - Not present yet; requires a dedicated Objective-C gRPC integration layer and stdio transport adaptation.
+- No generic slug-based `connect()` helper yet.
+- No full gRPC `serve` lifecycle helper yet.
+- No Holon-RPC server module yet.
