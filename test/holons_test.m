@@ -632,6 +632,19 @@ static BOOL wait_for_pid_exit(pid_t pid, NSTimeInterval timeout) {
   return !pid_exists(pid);
 }
 
+static pid_t wait_for_pid_file(NSString *path, NSTimeInterval timeout) {
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  while ([deadline timeIntervalSinceNow] > 0) {
+    NSString *pidText = trim_string(read_file_text(path));
+    pid_t pid = (pid_t)[pidText intValue];
+    if (pid > 0) {
+      return pid;
+    }
+    [NSThread sleepForTimeInterval:0.025];
+  }
+  return -1;
+}
+
 static int reserve_loopback_port(void) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
@@ -771,8 +784,7 @@ static void test_connect_slug_starts_ephemeral_stdio(void) {
     assert_eq(@"stdio://", channel.target, @"connect stdio slug target");
     assert_eq(@"stdio", channel.transport, @"connect stdio slug transport");
 
-    NSString *pidText = trim_string(read_file_text(pidFile));
-    pid_t pid = (pid_t)[pidText intValue];
+    pid_t pid = wait_for_pid_file(pidFile, 2.0);
     assert_true(pid > 0 && pid_exists(pid), @"connect stdio slug started process");
 
     NSString *portFile = [tmpRoot stringByAppendingPathComponent:@".op/run/connect-stdio.port"];
@@ -781,6 +793,28 @@ static void test_connect_slug_starts_ephemeral_stdio(void) {
     [Holons disconnect:channel];
     assert_true(wait_for_pid_exit(pid, 2.0), @"disconnect stdio slug stops ephemeral process");
     assert_true(access(pidFile.UTF8String, F_OK) != 0, @"disconnect stdio slug removes pid file");
+  }
+
+  HolonsConnectOptions *options = [HolonsConnectOptions new];
+  options.transport = @"stdio";
+
+  channel = [Holons connect:slug options:options];
+  assert_true(channel != nil, @"connect stdio slug with options returns channel");
+  if (channel != nil) {
+    assert_eq(@"stdio://", channel.target, @"connect stdio slug with options target");
+    assert_eq(@"stdio", channel.transport, @"connect stdio slug with options transport");
+
+    pid_t pid = wait_for_pid_file(pidFile, 2.0);
+    assert_true(pid > 0 && pid_exists(pid), @"connect stdio slug with options started process");
+
+    NSString *portFile = [tmpRoot stringByAppendingPathComponent:@".op/run/connect-stdio.port"];
+    assert_true(access(portFile.UTF8String, F_OK) != 0,
+                @"connect stdio slug with options does not write port file");
+
+    [Holons disconnect:channel];
+    assert_true(wait_for_pid_exit(pid, 2.0), @"disconnect stdio slug with options stops ephemeral process");
+    assert_true(access(pidFile.UTF8String, F_OK) != 0,
+                @"disconnect stdio slug with options removes pid file");
   }
 
   [[NSFileManager defaultManager] changeCurrentDirectoryPath:previousCwd];
@@ -838,8 +872,7 @@ static void test_connect_writes_and_reuses_port_file(void) {
   if (channel != nil) {
     assert_eq(@"tcp", channel.transport, @"connect tcp slug transport");
 
-    NSString *pidText = trim_string(read_file_text(pidFile));
-    pid_t wrapperPID = (pid_t)[pidText intValue];
+    pid_t wrapperPID = wait_for_pid_file(pidFile, 2.0);
     assert_true(wrapperPID > 0 && pid_exists(wrapperPID), @"connect tcp slug started wrapper");
 
     NSString *portFile = [tmpRoot stringByAppendingPathComponent:@".op/run/connect-persistent.port"];
@@ -919,8 +952,7 @@ static void test_connect_removes_stale_port_file(void) {
   GRPCChannel *channel = [Holons connect:slug];
   assert_true(channel != nil, @"connect stale slug returns channel");
   if (channel != nil) {
-    NSString *pidText = trim_string(read_file_text(pidFile));
-    pid_t pid = (pid_t)[pidText intValue];
+    pid_t pid = wait_for_pid_file(pidFile, 2.0);
     assert_true(pid > 0 && pid_exists(pid), @"connect stale slug starts fresh process");
     assert_true(access(portFile.UTF8String, F_OK) != 0, @"connect stale slug removes stale port file");
     [Holons disconnect:channel];

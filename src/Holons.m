@@ -2481,9 +2481,6 @@ static GRPCChannel *HOLConnectInternal(NSString *target,
   }
 
   if ([transport isEqualToString:@"stdio"]) {
-    if (!ephemeral) {
-      return nil;
-    }
     return HOLStartStdioHolon(binaryPath, timeout, YES);
   }
 
